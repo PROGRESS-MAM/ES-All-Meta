@@ -1,6 +1,10 @@
-# CSV Updater
+# Metadata File
 
-Schreibt einen vollstaendigen Export aller Clips inklusive aller Custom-Metadata-Felder aus der EditShare FLOW Metadata API in eine CSV-Datei. Jeder erfolgreiche Lauf erstellt die CSV komplett neu. Der Abruf laeuft ueber mehrere parallele Requester, um die Laufzeit auf wenige Stunden zu reduzieren.
+Schreibt einen vollstaendigen Export aller Clips inklusive aller Custom-Metadata-Felder aus der EditShare FLOW Metadata API in eine Parquet-Datei. Jeder Lauf startet frisch und erstellt die Datei komplett neu. Der Abruf laeuft ueber mehrere parallele Requester.
+
+Die Clips werden geschachtelt geschrieben, alle Blattspalten sind Typ Text. Custom-Felder liegen unter `custom_metadata.<Feldname>`. Punkte in Feldnamen werden zu Unterstrichen, doppelte Feldnamen bekommen ein Zaehlsuffix (`_2`, `_3`).
+
+Referenzlauf: 1.792.175 Clips, 34 Felder oberste Ebene, 417 Blattspalten, 0,8 GB, ca. 3,5 h.
 
 ## Dateien
 
@@ -8,116 +12,145 @@ Schreibt einen vollstaendigen Export aller Clips inklusive aller Custom-Metadata
 
 | Datei | Zweck |
 | --- | --- |
-| `metadata_csv.py` | Hauptskript mit Abruf-, Nacharbeits- und CSV-Logik |
-| `csv_updater_launcher.py` | Liegt eine Ebene ueber `metadata_csv.py` und startet dieses als eigenen Prozess, damit relative Pfade und Imports im Hauptskript unveraendert funktionieren |
+| `metadata_file.py` | Hauptskript mit Abruf-, Schema- und Parquet-Logik |
+| `metadata_file_launcher.py` | Liegt eine Ebene ueber `metadata_file/` und ruft `update_metadata_file()` auf. Flow Automation oder Standalone. |
 | `cred.env` | Zugangsdaten fuer die API |
 | `toolbox/` | Lokale Kopie des Toolbox-Pakets |
-| `requirements.txt` | pip-Abhaengigkeiten (siehe unten) |
+| `requirements.txt` | pip-Abhaengigkeiten |
 
-### Laufzeitdateien im `base_path`
+### Laufzeitdateien im `out_path`
 
 | Datei | Zweck |
 | --- | --- |
-| `all_clips_all_metadata.csv` | Aktuelle Ziel-CSV. Sie wird erst nach einem vollstaendig abgearbeiteten Abruf atomar ersetzt. |
-| `metadata_csv_failed_clips.csv` | Liste der im Einzelabruf nicht abrufbaren Clips. Wird bei jedem erfolgreichen Lauf neu geschrieben. Spalten: `code;clip_id`. |
-| `metadata_csv.log` | Lauf-, Fortschritts- und Fehlermeldungen. Wird beim Start geleert, wenn die konfigurierte Maximalgroesse ueberschritten ist. |
-| `clips_dump.jsonl` | Temporäre JSON-Lines-Zwischendatei waehrend eines Laufs. Sie wird nach erfolgreichem CSV-Export geloescht. Bei einem Laufzeitabbruch bleibt sie als Zwischenstand liegen. |
-| `metadata_csv.lock` | Verhindert parallele Laeufe. Ein zu altes Lock wird gemaess `ignore_lock_after_hours` ignoriert. |
-| `csv_backups/` | Enthält Backups der CSV vor jedem neuen Lauf. |
+| `all_clips_all_metadata.parquet` | Ziel-Datei. Wird erst nach vollstaendigem Abruf atomar ersetzt. |
+| `metadata_failed_clips.csv` | Im Einzelabruf nicht abrufbare Clips. Spalten: `code;clip_id`. Wird zu Laufbeginn geloescht und nur bei Eintraegen neu geschrieben. |
+| `metadata_file.log` | Lauf-, Fortschritts- und Fehlermeldungen. Wird beim Start geleert, wenn `max_log_size_MB` ueberschritten ist. |
+| `clips_dump.jsonl` | Zwischendatei des laufenden Abrufs. Wird zu Laufbeginn geloescht und nach erfolgreichem Schreiben entfernt. Bei Abbruch bleibt sie als Zwischenstand liegen. |
+| `metadata_file.lock` | Verhindert parallele Laeufe. Ein Lock aelter als `ignore_lock_after_hours` wird entfernt. |
+| `parquet_backups/` | Backups der vorherigen Parquet-Datei. |
 
 ## Requirements
 
 ```bash
 pip install --extra-index-url https://artifacts.editshare.com/artifactory/api/pypi/editshare-pypi-public/simple \
     editshare-flow-api~=2026.2.1.0
+pip install pyarrow python-dotenv
 ```
 
 ## Konfiguration
 
-Alle Einstellungen liegen im `CONFIG`-Block am Anfang von `metadata_csv.py`.
+Alle Einstellungen liegen im `CONFIG`-Block am Anfang von `metadata_file.py`.
 
 ### Allgemein
 
-| Variable | Bedeutung |
-| --- | --- |
-| `test_mode` | `True` = nur `test_mode_limit` Clips abrufen, `False` = alle Clips |
-| `test_mode_limit` | Anzahl Clips im Testmodus |
-| `pagnation_size` | Groesse des ersten API-Batches. Werte ueber ca. 2.000 fuehren zu HTTP-431-Fehlern. |
-| `num_requesters` | Anzahl paralleler Requester-Threads fuer alle Batch-Ebenen ausser dem Einzelabruf. Jeder nutzt einen eigenen API-Login. |
-| `stagger_seconds` | Wartezeit zwischen dem Start aufeinanderfolgender Requester |
-| `csv_max_backups` | Anzahl der aufzubewahrenden CSV-Backups |
+| Variable | Standard | Bedeutung |
+| --- | --- | --- |
+| `test_mode` | `False` | `True` = nur `test_mode_limit` Clips abrufen |
+| `test_mode_limit` | `10000` | Anzahl Clips im Testmodus |
+| `pagnation_size` | `400` | Groesse des ersten API-Batches. Werte ueber ca. 2.000 fuehren zu HTTP-431-Fehlern. |
+| `num_requesters` | `10` | Parallele Requester-Threads fuer alle Ebenen ausser dem Einzelabruf. Jeder nutzt einen eigenen API-Login. |
+| `stagger_seconds` | `5` | Wartezeit zwischen dem Start aufeinanderfolgender Requester |
+| `max_backups` | `5` | Anzahl aufzubewahrender Parquet-Backups |
+
+### Parquet
+
+| Variable | Standard | Bedeutung |
+| --- | --- | --- |
+| `row_group_size` | `50000` | Zeilen pro Blockgruppe |
+| `zstd_level` | `1` | zstd-Kompressionsstufe der Datenbloecke |
+| `row_group_heartbeat_every` | `5` | Blockgruppen zwischen zwei Fortschrittsmeldungen der Schreibphase |
 
 ### Nacharbeit fehlgeschlagener oder unvollstaendiger Batches
 
-| Variable | Bedeutung |
-| --- | --- |
-| `redo_split_factor` | Teilt die Batchgroesse pro Nacharbeits-Ebene. Bei `pagnation_size = 400` und Faktor `8` entsteht die Leiter `[400, 50, 1]`. |
-| `redo_min_batch_size` | Kleinste Batchgroesse vor dem Einzelabruf. Bei `50` endet die Leiter bei `[400, 50, 1]`. |
-| `single_clip_requesters` | Anzahl Requester ausschliesslich fuer die Einzelabruf-Ebene mit Batchgroesse `1`. Alle vorherigen Ebenen nutzen `num_requesters`. |
+| Variable | Standard | Bedeutung |
+| --- | --- | --- |
+| `redo_split_factor` | `8` | Teilt die Batchgroesse pro Ebene. Mit `pagnation_size = 400` entsteht die Leiter `[400, 50, 1]`. |
+| `redo_min_batch_size` | `50` | Kleinste Batchgroesse vor dem Einzelabruf |
+| `single_clip_requesters` | `1` | Requester fuer die Einzelabruf-Ebene mit Batchgroesse `1` |
 
-Ein Batch wird nur dann geschrieben, wenn die API mit Code `200` genau so viele Clips liefert wie angefragt. Bei einem anderen Return Code oder bei einer abweichenden Anzahl wird der gesamte Batch in der naechsten Ebene kleiner aufgeteilt.
+Ein Batch wird nur geschrieben, wenn die API mit Code `200` genau so viele Clips liefert wie angefragt. Sonst wandert die gesamte ID-Gruppe eine Ebene tiefer.
 
 ### Laufzeit, Lock und Log
 
-| Variable | Bedeutung |
-| --- | --- |
-| `max_runtime_hours` | Maximale Laufzeit fuer den Abruf. Die Schreibphase der finalen CSV liegt danach ausserhalb dieser Grenze. Bruchteile sind erlaubt, zum Beispiel `0.5` fuer einen Test. |
-| `ignore_lock_after_hours` | Alter, ab dem ein vorhandenes Lock als liegengeblieben gilt und entfernt wird. Der Wert muss groesser als `max_runtime_hours` plus Schreibphase sein und unter dem Takt geplanter Laeufe liegen. |
-| `max_log_size_MB` | Maximale Groesse der Haupt-Logdatei. Ist sie beim Start groesser, wird sie mit einer entsprechenden Notiz geleert. |
-| `batch_heartbeat_every` | Anzahl verarbeiteter Batches zwischen zwei Fortschrittsmeldungen pro Ebene. |
+| Variable | Standard | Bedeutung |
+| --- | --- | --- |
+| `max_runtime_hours` | `18` | Maximale Laufzeit fuer den Abruf. Schema- und Schreibphase liegen ausserhalb dieser Grenze. Bruchteile erlaubt. |
+| `ignore_lock_after_hours` | `20` | Alter, ab dem ein Lock als liegengeblieben gilt. Muss groesser als `max_runtime_hours` plus Schreibphase sein und unter dem Takt geplanter Laeufe liegen. |
+| `max_log_size_MB` | `100` | Maximale Groesse der Haupt-Logdatei |
+| `batch_heartbeat_every` | `250` | Batches zwischen zwei Fortschrittsmeldungen pro Ebene |
 
 ### Pfade
 
 | Variable | Bedeutung |
 | --- | --- |
-| `base_path` | Gemeinsamer Ausgabeordner fuer CSV, Log, Dump, Lock, Fehlerliste und Backups |
-| `cred_path` | Pfad zur `cred.env` mit den API-Zugangsdaten |
-| `main_log` | Pfad zur Haupt-Logdatei |
-| `csv_dump_path` | Pfad zur temporären JSON-Lines-Dump-Datei |
-| `csv_file_path` | Pfad zur Ziel-CSV. Sie wird atomar ersetzt: erst `.tmp` schreiben, dann umbenennen. |
-| `failed_clips_path` | Pfad zur Fehlerliste `metadata_csv_failed_clips.csv` |
-| `csv_backup_path` | Ordner fuer Backups der vorherigen CSV |
-| `lock_path` | Pfad zur Lock-Datei |
+| `out_path` | Ausgabeordner fuer Parquet, Log, Dump, Lock, Fehlerliste und Backups |
+| `cred_path` | `cred.env` mit den API-Zugangsdaten, neben dem Skript |
+| `main_log` | Haupt-Logdatei |
+| `clips_dump_path` | JSON-Lines-Zwischendatei |
+| `parquet_file_path` | Ziel-Parquet. Wird atomar ersetzt: erst `.tmp` schreiben, dann umbenennen. |
+| `failed_clips_path` | Fehlerliste `metadata_failed_clips.csv` |
+| `parquet_backup_path` | Backup-Ordner |
+| `lock_path` | Lock-Datei |
 
 ## Deploy auf Worker-Node
 
-1. **Kopieren nach** `var\flow\automation\scripts\csv_updater`:
-   - `toolbox` – `__init__.py` und `toolbox.py`
-   - `metadata_csv.py`
+1. **Kopieren nach** `/var/flow/automation/scripts/metadata_file`:
+   - `toolbox` - `__init__.py` und `toolbox.py`
+   - `metadata_file.py`
    - `cred.env`
 
-2. **Kopieren nach** `var\flow\automation\scripts`:
-   - `csv_updater_launcher.py`
+2. **Kopieren nach** `/var/flow/automation/scripts`:
+   - `metadata_file_launcher.py`
 
 3. **Ausfuehrbar machen:**
 
    ```bash
-   chmod +x /var/flow/automation/scripts/csv_updater_launcher.py
+   chmod +x /var/flow/automation/scripts/metadata_file_launcher.py
+   chmod +x /var/flow/automation/scripts/metadata_file/metadata_file.py
    ```
 
 4. **Start einrichten:**
-   - ueber **Flow Automation** mit den Modulen **Time** und **Script Runner**, die `csv_updater_launcher.py` aufrufen.
+   - ueber **Flow Automation** mit den Modulen **Time** und **Script Runner**, die `metadata_file_launcher.py` aufrufen.
+
+Alle Dateien muessen UNIX-Zeilenenden (LF) haben.
+
+## Manueller Start
+
+```bash
+/var/flow/automation/scripts/metadata_file_launcher.py --standalone
+```
+
+Fortschritt auf stdout, Exit-Code `0` = ok, `1` = Fehler. Ohne `--standalone` laeuft der Launcher als AutomationScript, sofern `editshare_helpers` verfuegbar ist.
 
 ## Ablauf beim Start
 
-`csv_updater_launcher.py` startet `metadata_csv.py` im Unterordner `csv_updater` als eigenstaendigen Prozess.
+Der Launcher importiert `metadata_file` aus dem Unterordner und ruft `update_metadata_file()` auf.
 
-`metadata_csv.py` fuehrt dann diese Schritte aus:
-
-1. Ausgabeordner und Schreibrechte pruefen. Falls das Haupt-Log groesser als `max_log_size_MB` ist, wird es mit einer Notiz als erster Zeile geleert.
-2. Lock pruefen und setzen. Ein vorhandenes, juengeres Lock beendet den neuen Lauf sofort. Nur ein Lock, das aelter als `ignore_lock_after_hours` ist, wird entfernt.
+1. Ausgabeordner und Schreibrechte pruefen, Haupt-Log bei Ueberschreitung von `max_log_size_MB` leeren.
+2. Lock pruefen und setzen. Ein juengeres Lock beendet den neuen Lauf sofort.
 3. Verbindung zur Metadata-API herstellen.
-4. Bestehende Ziel-CSV sichern, alte Backups ueber `csv_max_backups` hinaus loeschen und eine vorhandene Dump-Datei des vorherigen Laufs entfernen.
+4. Dump und Fehlerliste des letzten Laufs loeschen, bestehende Parquet-Datei sichern, Backups ueber `max_backups` hinaus loeschen.
 5. Anzahl und Liste aller Clip-IDs abrufen.
-6. Alle Clips in der ersten Ebene mit `pagnation_size` abrufen, normalerweise in 400er-Batches. Die Batches werden ueber `num_requesters` parallele Requester verteilt.
-7. Pro Batch Return Code und Anzahl gelieferter Clips pruefen:
-   - Code `200` und gleiche Anzahl wie angefragt: alle Clips flatten und in die Dump-Datei schreiben.
-   - Anderer Return Code, weniger oder mehr gelieferte Clips: nichts aus diesem Batch schreiben. Die gesamte ID-Gruppe wird fuer die naechste Ebene vorgemerkt.
-8. Vorgemerkte Gruppen eine Ebene kleiner erneut abrufen. Bei der Standardkonfiguration erfolgt der Ablauf `400 -> 50 -> 1`.
-9. Im Einzelabruf werden erfolgreich gelieferte Clips geschrieben. Nicht erfolgreich gelieferte Clips werden mit Return Code und Clip-ID in `metadata_csv_failed_clips.csv` geschrieben. Der Wert `200 aber keine Daten von API` bedeutet: Die API meldete Erfolg, lieferte fuer die angefragte ID aber keinen Clip.
-10. Vor jedem neuen Batch die Abrufzeit pruefen. Nach `max_runtime_hours` wird der Abruf abgebrochen. Dann werden weder Ziel-CSV noch Fehlerliste ersetzt; der Stand des vorherigen erfolgreichen Laufs bleibt erhalten.
-11. Nach einem vollstaendig abgearbeiteten Abruf alle im Dump vorkommenden Spalten ermitteln und die finale CSV atomar schreiben.
-12. Dump-Datei loeschen, Fehlerliste fuer diesen Lauf schreiben und Abschluss mit Kennzahlen loggen.
+6. Custom-Field-Definitionen abrufen und `db_key` auf Feldnamen abbilden.
+7. Alle Clips in der ersten Ebene mit `pagnation_size` abrufen, verteilt auf `num_requesters`.
+8. Pro Batch Return Code und Anzahl pruefen:
+   - Code `200` und gleiche Anzahl: Custom-Felder umbenennen, Clips geschachtelt in die Dump-Datei schreiben.
+   - Sonst: nichts schreiben, gesamte ID-Gruppe fuer die naechste Ebene vormerken.
+9. Vorgemerkte Gruppen eine Ebene kleiner erneut abrufen, Standard `400 -> 50 -> 1`.
+10. Im Einzelabruf nicht gelieferte Clips mit Return Code und Clip-ID vormerken. `200 aber keine Daten von API` bedeutet: Die API meldete Erfolg, lieferte fuer die ID aber keinen Clip.
+11. Vor jedem Batch die Abrufzeit pruefen. Nach `max_runtime_hours` wird abgebrochen.
+12. Schema aus dem gesamten Dump ermitteln, Parquet in Blockgruppen von `row_group_size` Zeilen schreiben, mit zstd Stufe `zstd_level` komprimieren, dann atomar ersetzen.
+13. Dump loeschen, Fehlerliste schreiben, Abschluss mit Kennzahlen loggen.
 
-Die Verarbeitung eines Clips selbst bleibt unveraendert: Wenn `flatten()` oder die weitere Aufbereitung eine Exception ausloest, bricht der gesamte Lauf ab.
+## Abbruchbedingungen
 
+Es wird nichts geschrieben, die Parquet-Datei des letzten Laufs bleibt unveraendert, der Zwischenstand bleibt in `clips_dump.jsonl`:
+
+- Laufzeitgrenze `max_runtime_hours` erreicht
+- kein einziger Clip abrufbar
+- Widerspruch in der Struktur: dasselbe Feld liefert Text und Objekt oder Objekt und Liste. Einzelwert und Liste im selben Feld werden zur Liste zusammengefuehrt.
+- ein Schluessel liegt nicht im Schema
+- ein Clip liefert bereits ein Feld `custom_metadata`
+- ein nicht abgebildeter `db_key` liefert einen bereits belegten Feldnamen
+
+Die Meldung nennt jeweils den vollstaendigen Feldpfad.
