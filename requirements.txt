@@ -1,0 +1,2 @@
+--extra-index-url https://artifacts.editshare.com/artifactory/api/pypi/editshare-pypi-public/simple editshare-flow-api~=2026.2.1.0
+pyarrow
