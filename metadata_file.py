@@ -24,9 +24,9 @@ if str(script_path) not in sys.path:
     sys.path.insert(0, str(script_path))
 
 try:
-    from toolbox import tb_link_api, tb_write_log
+    from toolbox import tb_link_api, tb_get_duration_hours_from_tc, tb_write_log
 except ImportError:
-    from toolbox.toolbox import tb_link_api, tb_write_log
+    from toolbox.toolbox import tb_link_api, tb_get_duration_hours_from_tc, tb_write_log
 
 
 # --------- CONFIG ---------
@@ -323,6 +323,49 @@ def rename_custom_metadata(clip: dict, dictionary: dict):
     return clip
 
 
+def normalize_field_name(name):
+    """Einen Feldnamen auf ein stabiles Schluessel-Format fuer Vergleiche normalisieren."""
+    text = str(name).strip().lower()
+    text = text.replace(".", " ").replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", text)
+
+
+def find_timecode_value(data, target_names: set[str]):
+    """Einen Wert in einem verschachtelten Clip-Objekt anhand der Timecode-Feldnamen finden."""
+    if isinstance(data, dict):
+        for key, value in data.items():
+            normalized_key = normalize_field_name(key)
+            if normalized_key in target_names:
+                return value
+            nested_value = find_timecode_value(value, target_names)
+            if nested_value is not None:
+                return nested_value
+    elif isinstance(data, list):
+        for item in data:
+            nested_value = find_timecode_value(item, target_names)
+            if nested_value is not None:
+                return nested_value
+    return None
+
+
+def add_duration_h_to_clip(clip: dict) -> dict:
+    """Berechnet Duration_h aus den Timecode-Feldern eines Clips, falls vorhanden."""
+    if not isinstance(clip, dict):
+        return clip
+
+    start_value = find_timecode_value(clip, {"tc start", "timecode start"})
+    end_value = find_timecode_value(clip, {"tc end", "timecode end"})
+    if start_value is None or end_value is None:
+        return clip
+
+    duration_h = tb_get_duration_hours_from_tc(str(start_value), str(end_value))
+    if duration_h is None:
+        return clip
+
+    clip["duration hour"] = duration_h
+    return clip
+
+
 def natural_sort_key(s):
     return [
         (1, int(part)) if part.isdigit() else (0, part.lower())
@@ -560,7 +603,8 @@ def fetch_all_clips_multi(metadata_api, clip_ids: list, pagnation: int, dump_pat
                     )
 
                 if reason is None:
-                    rows = [rename_custom_metadata(clip, api_to_field) for clip in clips_batch]
+                    rows = [add_duration_h_to_clip(rename_custom_metadata(clip, api_to_field))
+                            for clip in clips_batch]
 
                     with dump_lock:
                         with dump_path.open("a", encoding="utf-8") as dump_file:
