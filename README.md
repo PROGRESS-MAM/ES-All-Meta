@@ -95,7 +95,7 @@ Ein Batch wird nur geschrieben, wenn die API mit Code `200` genau so viele Clips
 ## Deploy auf Worker-Node
 
 1. **Kopieren nach** `/var/flow/automation/scripts/metadata_file`:
-   - `toolbox` - `__init__.py` und `toolbox.py`
+   - `toolbox` - `__init__.py` und `toolbox_mini.py`
    - `metadata_file.py`
    - `cred.env`
 
