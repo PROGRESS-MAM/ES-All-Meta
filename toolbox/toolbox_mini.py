@@ -4,6 +4,7 @@
 import os
 from datetime import datetime
 from pathlib import Path
+from fractions import Fraction
 
 import FlowAPI
 from dotenv import load_dotenv
@@ -34,27 +35,42 @@ def tb_write_log(log_path: Path, message: str) -> None:
 
 # --------- TIMECODE ---------
 def tb_get_duration_hours_from_tc(tc_start: str, tc_end: str) -> str | None:
-    '''Return the duration between two hh:mm:ss:ff/fps timecodes in hours.'''
-    if tc_start is None or tc_end is None:
+    """Return elapsed hours from two timecodes or None for an invalid pair.
+
+    Accept hh:mm:ss:ff/fps and hh:mm:ss:ff:rate_n/rate_d. An optional nd
+    suffix is ignored; HH:MM:SS represent clock time, without drop-frame
+    or 24-hour rollover correction.
+    """
+    if not isinstance(tc_start, str) or not isinstance(tc_end, str):
         return None
 
-    def parse_tc_to_seconds(tc_value: str) -> float:
-        try:
-            time_part, fps_value = tc_value.rsplit("/", 1)
-            hours, minutes, seconds, frames = map(int, time_part.split(":"))
-            fps = int(fps_value)
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Invalid timecode '{tc_value}'. Expected hh:mm:ss:ff/fps."
-            ) from exc
+    def parse_tc(tc_value: str) -> tuple[Fraction, Fraction] | None:
+        tokens = tc_value.strip().split()
+        if len(tokens) not in (1, 2) or (len(tokens) == 2 and tokens[1].casefold() != "nd"):
+            return None
+        body, separator, rate_tail = tokens[0].partition("/")
+        parts = body.split(":")
+        if not separator or len(parts) not in (4, 5) or not all(
+            part.isascii() and part.isdecimal() for part in (*parts, rate_tail)
+        ):
+            return None
 
-        if fps <= 0 or min(hours, minutes, seconds, frames) < 0:
-            raise ValueError(f"Invalid timecode values in '{tc_value}'.")
+        hours, minutes, seconds, frames = map(int, parts[:4])
+        numerator = int(parts[4] if len(parts) == 5 else rate_tail)
+        denominator = int(rate_tail) if len(parts) == 5 else 1
+        if numerator < 1 or denominator < 1 or minutes >= 60 or seconds >= 60:
+            return None
+        fps = Fraction(numerator, denominator)
+        if frames >= round(fps):
+            return None
+        time_seconds = Fraction(hours * 3600 + minutes * 60 + seconds) + frames / fps
+        return time_seconds, fps
 
-        return hours * 3600 + minutes * 60 + seconds + frames / fps
-
-    duration_hours = (parse_tc_to_seconds(tc_end) - parse_tc_to_seconds(tc_start)) / 3600
-    return f"{duration_hours:.4f}"
+    start = parse_tc(tc_start)
+    end = parse_tc(tc_end)
+    if start is None or end is None or start[1] != end[1] or end[0] < start[0]:
+        return None
+    return f"{float((end[0] - start[0]) / 3600):.8f}"
 
 
 __all__ = [

@@ -323,46 +323,24 @@ def rename_custom_metadata(clip: dict, dictionary: dict):
     return clip
 
 
-def normalize_field_name(name):
-    """Einen Feldnamen auf ein stabiles Schluessel-Format fuer Vergleiche normalisieren."""
-    text = str(name).strip().lower()
-    text = text.replace(".", " ").replace("_", " ").replace("-", " ")
-    return re.sub(r"\s+", " ", text)
-
-
-def find_timecode_value(data, target_names: set[str]):
-    """Einen Wert in einem verschachtelten Clip-Objekt anhand der Timecode-Feldnamen finden."""
-    if isinstance(data, dict):
-        for key, value in data.items():
-            normalized_key = normalize_field_name(key)
-            if normalized_key in target_names:
-                return value
-            nested_value = find_timecode_value(value, target_names)
-            if nested_value is not None:
-                return nested_value
-    elif isinstance(data, list):
-        for item in data:
-            nested_value = find_timecode_value(item, target_names)
-            if nested_value is not None:
-                return nested_value
-    return None
-
-
 def add_duration_h_to_clip(clip: dict) -> dict:
-    """Berechnet Duration_h aus den Timecode-Feldern eines Clips, falls vorhanden."""
+    """Add duration hour only from metadata.timecode_start and timecode_end."""
     if not isinstance(clip, dict):
         return clip
 
-    start_value = find_timecode_value(clip, {"tc start", "timecode start"})
-    end_value = find_timecode_value(clip, {"tc end", "timecode end"})
+    metadata = clip.get("metadata")
+    if isinstance(metadata, dict):
+        start_value = metadata.get("timecode_start")
+        end_value = metadata.get("timecode_end")
+    else:
+        start_value = clip.get("metadata.timecode_start")
+        end_value = clip.get("metadata.timecode_end")
     if start_value is None or end_value is None:
         return clip
 
     duration_h = tb_get_duration_hours_from_tc(str(start_value), str(end_value))
-    if duration_h is None:
-        return clip
-
-    clip["duration hour"] = duration_h
+    if duration_h is not None:
+        clip["duration hour"] = duration_h
     return clip
 
 
